@@ -1,0 +1,389 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+// שים כאן את ה-Client ID שתקבל מ-Google Cloud Console
+const GOOGLE_CLIENT_ID = "291474461531-ds0obc1cds2584dttq3tbtj1f0rnjd4e.apps.googleusercontent.com";
+const GMAIL_SCOPES = "https://www.googleapis.com/auth/gmail.readonly";
+
+// ─── CATEGORIES ────────────────────────────────────────────────────────────
+const CATEGORIES = [
+  { id: "food",          label: "🍕 מזון",        color: "#FF6B35" },
+  { id: "fashion",       label: "👗 אופנה",        color: "#E91E8C" },
+  { id: "beauty",        label: "💄 יופי",         color: "#9C27B0" },
+  { id: "tech",          label: "💻 טכנולוגיה",   color: "#2196F3" },
+  { id: "travel",        label: "✈️ נסיעות",       color: "#00BCD4" },
+  { id: "health",        label: "🏃 בריאות",       color: "#4CAF50" },
+  { id: "home",          label: "🏠 בית",          color: "#FF9800" },
+  { id: "entertainment", label: "🎬 בידור",        color: "#F44336" },
+  { id: "supermarket",   label: "🛒 סופר",         color: "#8BC34A" },
+  { id: "pharmacy",      label: "💊 בית מרקחת",   color: "#00BFA5" },
+  { id: "other",         label: "🎁 אחר",          color: "#607D8B" },
+];
+
+// ─── COUPON DETECTION PATTERNS ─────────────────────────────────────────────
+const COUPON_KEYWORDS_HE = ["קופון","הנחה","שובר","זיכוי","הטבה","מבצע","חינם","קוד","% הנחה","₪ הנחה","קוד הטבה","קוד קופון","תוקף","בתוקף עד","פג תוקף","קוד פרומו"];
+const COUPON_KEYWORDS_EN = ["coupon","discount","voucher","promo","offer","deal","code","% off","free","sale","promocode","redeem","valid until","expires"];
+const CODE_PATTERN = /\b([A-Z0-9]{4,20})\b/g;
+const PERCENT_PATTERN = /(\d+)%/;
+const SHEKEL_PATTERN = /(\d+)\s*₪/;
+const DATE_PATTERN_HE = /(\d{1,2})[./](\d{1,2})[./](\d{2,4})/g;
+const DATE_PATTERN_EN = /(\d{4})-(\d{2})-(\d{2})/g;
+
+// ─── HELPERS ───────────────────────────────────────────────────────────────
+const getDaysLeft = (expiry) => {
+  if (!expiry) return 999;
+  const today = new Date(); today.setHours(0,0,0,0);
+  const exp   = new Date(expiry); exp.setHours(0,0,0,0);
+  return Math.round((exp - today) / 86400000);
+};
+
+const catColor = (cat) => CATEGORIES.find(c => c.id === cat)?.color || "#607D8B";
+
+const extractCouponFromText = (subject, body, source) => {
+  const text = (subject + " " + body).toLowerCase();
+  const isHe = COUPON_KEYWORDS_HE.some(k => (subject + " " + body).includes(k));
+  const isEn = COUPON_KEYWORDS_EN.some(k => text.includes(k));
+  if (!isHe && !isEn) return null;
+
+  const fullText = subject + " " + body;
+
+  // discount
+  let discount = "";
+  const pct = fullText.match(PERCENT_PATTERN);
+  const shk = fullText.match(SHEKEL_PATTERN);
+  if (pct) discount = pct[0] + " הנחה";
+  else if (shk) discount = shk[0] + " הנחה";
+  else if (isHe && fullText.includes("חינם")) discount = "חינם";
+  else if (isEn && text.includes("free")) discount = "Free";
+
+  // code
+  const codes = (fullText.match(CODE_PATTERN) || []).filter(c =>
+    !["HTTP","HTTPS","HTML","FROM","SENT","DATE","SUBJECT","THE","AND","FOR","YOU","YOUR","WITH","THIS","THAT"].includes(c)
+  );
+  const code = codes[0] || "";
+
+  // expiry
+  let expiry = "";
+  const datesHe = [...fullText.matchAll(DATE_PATTERN_HE)];
+  const datesEn = [...fullText.matchAll(DATE_PATTERN_EN)];
+  if (datesHe.length) {
+    const m = datesHe[0];
+    const y = m[3].length === 2 ? "20" + m[3] : m[3];
+    expiry = `${y}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`;
+  } else if (datesEn.length) {
+    const m = datesEn[0];
+    expiry = `${m[1]}-${m[2]}-${m[3]}`;
+  } else {
+    // default 30 days
+    const d = new Date(); d.setDate(d.getDate() + 30);
+    expiry = d.toISOString().split("T")[0];
+  }
+
+  // category guess
+  let category = "other";
+  const t = text;
+  if (t.includes("זאר") || t.includes("h&m") || t.includes("אופנה") || t.includes("fashion") || t.includes("בגד")) category = "fashion";
+  else if (t.includes("מסעדה") || t.includes("פיצה") || t.includes("מקדונלד") || t.includes("food") || t.includes("burger") || t.includes("אוכל")) category = "food";
+  else if (t.includes("סופר") || t.includes("שופרסל") || t.includes("רמי לוי") || t.includes("מגה") || t.includes("יינות")) category = "supermarket";
+  else if (t.includes("טיסה") || t.includes("מלון") || t.includes("travel") || t.includes("hotel") || t.includes("flight") || t.includes("ел אל")) category = "travel";
+  else if (t.includes("יופי") || t.includes("beauty") || t.includes("קוסמטיקה") || t.includes("l'oreal") || t.includes("טיפול")) category = "beauty";
+  else if (t.includes("טכנולוגיה") || t.includes("tech") || t.includes("מחשב") || t.includes("סלולר") || t.includes("ksp") || t.includes("ivory")) category = "tech";
+  else if (t.includes("בית מרקחת") || t.includes("סופר-פארם") || t.includes("pharmacy") || t.includes("תרופה")) category = "pharmacy";
+  else if (t.includes("ספורט") || t.includes("כושר") || t.includes("sport") || t.includes("gym")) category = "health";
+
+  return {
+    id: Date.now() + Math.random(),
+    title: subject.slice(0, 60) || "קופון מהמייל",
+    store: "",
+    category,
+    discount,
+    code,
+    expiry,
+    source,
+    used: false,
+    notes: "",
+    image: null,
+    rawText: body.slice(0, 200),
+  };
+};
+
+// ─── STORAGE ───────────────────────────────────────────────────────────────
+const STORAGE_KEY = "koponi_coupons_v1";
+const loadCoupons  = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; } };
+const saveCoupons  = (c) => localStorage.setItem(STORAGE_KEY, JSON.stringify(c));
+
+// ══════════════════════════════════════════════════════════════════════════════
+export default function App() {
+  const [coupons, setCoupons]           = useState(loadCoupons);
+  const [view, setView]                 = useState("home");
+  const [filterCat, setFilterCat]       = useState("all");
+  const [filterStatus, setFilterStatus] = useState("active");
+  const [sortBy, setSortBy]             = useState("expiry");
+  const [search, setSearch]             = useState("");
+  const [selectedCoupon, setSelectedCoupon] = useState(null);
+  const [toast, setToast]               = useState(null);
+  const [scanLoading, setScanLoading]   = useState(false);
+  const [scanResults, setScanResults]   = useState([]);
+  const [scanProgress, setScanProgress] = useState("");
+  const [gmailToken, setGmailToken]     = useState(null);
+  const [gmailUser, setGmailUser]       = useState(null);
+  const [ocrLoading, setOcrLoading]     = useState(false);
+  const [form, setForm]                 = useState({ title:"", store:"", category:"other", discount:"", code:"", expiry:"", notes:"", source:"manual", image:null });
+  const fileInputRef   = useRef();
+  const cameraInputRef = useRef();
+  const gapiLoaded     = useRef(false);
+
+  // persist
+  useEffect(() => saveCoupons(coupons), [coupons]);
+
+  // notifications
+  useEffect(() => {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+    // check expiring daily
+    const check = () => {
+      if (Notification.permission !== "granted") return;
+      coupons.filter(c => !c.used && getDaysLeft(c.expiry) <= 2 && getDaysLeft(c.expiry) >= 0)
+        .forEach(c => new Notification(`⚠️ קופוני — ${c.title}`, { body: `פג תוקף בעוד ${getDaysLeft(c.expiry)} ימים!`, icon: "/logo192.png" }));
+    };
+    const t = setInterval(check, 60 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [coupons]);
+
+  // load Google API
+  useEffect(() => {
+    if (gapiLoaded.current) return;
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.onload = () => { gapiLoaded.current = true; };
+    document.body.appendChild(script);
+  }, []);
+
+  const showToast = (msg, type = "success") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3500);
+  };
+
+  // ── GMAIL LOGIN ──────────────────────────────────────────────────────────
+  const loginGmail = useCallback(() => {
+    if (!window.google) { showToast("Google API לא נטען, נסה שוב", "error"); return; }
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GMAIL_SCOPES,
+      callback: (resp) => {
+        if (resp.error) { showToast("שגיאה בהתחברות לגוגל", "error"); return; }
+        setGmailToken(resp.access_token);
+        fetch("https://www.googleapis.com/oauth2/v1/userinfo?access_token=" + resp.access_token)
+          .then(r => r.json()).then(u => setGmailUser(u.email));
+        showToast("✅ מחובר ל-Gmail!");
+      },
+    });
+    client.requestAccessToken();
+  }, []);
+
+  // ── GMAIL SCAN ───────────────────────────────────────────────────────────
+  const scanGmail = useCallback(async () => {
+    if (!gmailToken) { loginGmail(); return; }
+    setScanLoading(true);
+    setScanResults([]);
+    setScanProgress("מחפש הודעות רלוונטיות...");
+
+    try {
+      const queries = [
+        "קופון OR הנחה OR שובר OR זיכוי OR הטבה OR מבצע",
+        "coupon OR discount OR promo OR voucher OR offer",
+        "label:spam קופון OR הנחה OR coupon OR promo",
+      ];
+      let allIds = [];
+      for (const q of queries) {
+        setScanProgress(`סורק: ${q.slice(0,30)}...`);
+        const r = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=30&q=${encodeURIComponent(q)}`,
+          { headers: { Authorization: "Bearer " + gmailToken } }
+        );
+        const data = await r.json();
+        if (data.messages) allIds.push(...data.messages.map(m => m.id));
+      }
+      // deduplicate
+      allIds = [...new Set(allIds)].slice(0, 60);
+      setScanProgress(`נמצאו ${allIds.length} הודעות, מנתח...`);
+
+      const found = [];
+      for (let i = 0; i < allIds.length; i++) {
+        setScanProgress(`מנתח הודעה ${i+1} מתוך ${allIds.length}...`);
+        const r = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${allIds[i]}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`,
+          { headers: { Authorization: "Bearer " + gmailToken } }
+        );
+        const msg = await r.json();
+        const subjectHeader = msg.payload?.headers?.find(h => h.name === "Subject");
+        const subject = subjectHeader?.value || "";
+        const snippet = msg.snippet || "";
+        const coupon = extractCouponFromText(subject, snippet, "email");
+        if (coupon) {
+          // check not already saved
+          const alreadyExists = coupons.some(c => c.title === coupon.title && c.code === coupon.code);
+          const alreadyInResults = found.some(c => c.title === coupon.title);
+          if (!alreadyExists && !alreadyInResults) found.push(coupon);
+        }
+      }
+      setScanResults(found);
+      setScanProgress("");
+      setScanLoading(false);
+      if (found.length === 0) showToast("לא נמצאו קופונים חדשים במייל", "info");
+      else showToast(`🎉 נמצאו ${found.length} קופונים!`);
+    } catch (e) {
+      console.error(e);
+      showToast("שגיאה בסריקת Gmail: " + e.message, "error");
+      setScanLoading(false);
+      setScanProgress("");
+    }
+  }, [gmailToken, coupons, loginGmail]);
+
+  // ── OCR (Tesseract via CDN) ──────────────────────────────────────────────
+  const analyzeImage = useCallback(async (imageDataUrl, sourceType) => {
+    setOcrLoading(true);
+    showToast("🔍 מנתח את התמונה...");
+    try {
+      // load Tesseract if not loaded
+      if (!window.Tesseract) {
+        await new Promise((res, rej) => {
+          const s = document.createElement("script");
+          s.src = "https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js";
+          s.onload = res; s.onerror = rej;
+          document.body.appendChild(s);
+        });
+      }
+      const result = await window.Tesseract.recognize(imageDataUrl, "heb+eng", {
+        logger: m => { if (m.status === "recognizing text") setScanProgress(`זיהוי טקסט: ${Math.round(m.progress*100)}%`); }
+      });
+      const text = result.data.text;
+      setScanProgress("");
+      const coupon = extractCouponFromText("קופון מתמונה", text, sourceType);
+      if (coupon) {
+        coupon.image = imageDataUrl;
+        coupon.rawText = text.slice(0, 300);
+        // pre-fill form with detected data
+        setForm({
+          title: coupon.title,
+          store: coupon.store,
+          category: coupon.category,
+          discount: coupon.discount,
+          code: coupon.code,
+          expiry: coupon.expiry,
+          notes: "זוהה אוטומטית מתמונה",
+          source: sourceType,
+          image: imageDataUrl,
+        });
+        showToast("✅ פרטי הקופון זוהו אוטומטית!");
+      } else {
+        setForm(f => ({ ...f, image: imageDataUrl, source: sourceType }));
+        showToast("תמונה נטענה — מלא את הפרטים ידנית");
+      }
+      setView("add");
+    } catch (e) {
+      console.error(e);
+      setForm(f => ({ ...f, image: imageDataUrl, source: sourceType }));
+      showToast("תמונה נטענה (לא ניתן לזהות טקסט)");
+      setView("add");
+    }
+    setOcrLoading(false);
+  }, []);
+
+  const handleImageInput = (e, fromCamera) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => analyzeImage(ev.target.result, fromCamera ? "camera" : "gallery");
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  // ── COUPON ACTIONS ───────────────────────────────────────────────────────
+  const addCoupon = () => {
+    if (!form.title || !form.expiry) { showToast("נא למלא כותרת ותוקף", "error"); return; }
+    setCoupons(prev => [{ ...form, id: Date.now(), used: false }, ...prev]);
+    setForm({ title:"", store:"", category:"other", discount:"", code:"", expiry:"", notes:"", source:"manual", image:null });
+    setView("list");
+    showToast("🎉 קופון נוסף!");
+  };
+
+  const importCoupon = (c) => {
+    setCoupons(prev => [{ ...c, id: Date.now() + Math.random(), used: false }, ...prev]);
+    setScanResults(prev => prev.filter(x => x !== c));
+    showToast(`✅ "${c.title.slice(0,20)}" נוסף!`);
+  };
+
+  const importAll = () => {
+    setCoupons(prev => [...scanResults.map(c => ({ ...c, id: Date.now() + Math.random(), used: false })), ...prev]);
+    setScanResults([]);
+    showToast(`✅ כל הקופונים נוספו!`);
+  };
+
+  const markUsed = (id) => {
+    setCoupons(prev => prev.map(c => c.id === id ? { ...c, used: !c.used } : c));
+    if (selectedCoupon?.id === id) setSelectedCoupon(p => ({ ...p, used: !p.used }));
+    showToast("✅ סטטוס עודכן");
+  };
+
+  const deleteCoupon = (id) => {
+    setCoupons(prev => prev.filter(c => c.id !== id));
+    setSelectedCoupon(null);
+    setView("list");
+    showToast("🗑️ נמחק");
+  };
+
+  // ── DERIVED DATA ─────────────────────────────────────────────────────────
+  const activeCoupons   = coupons.filter(c => !c.used && getDaysLeft(c.expiry) >= 0);
+  const expiringCoupons = coupons.filter(c => !c.used && getDaysLeft(c.expiry) >= 0 && getDaysLeft(c.expiry) <= 3);
+
+  const filtered = coupons
+    .filter(c => {
+      if (filterCat !== "all" && c.category !== filterCat) return false;
+      const days = getDaysLeft(c.expiry);
+      if (filterStatus === "active"  && (c.used || days < 0)) return false;
+      if (filterStatus === "expired" && (c.used || days >= 0)) return false;
+      if (filterStatus === "used"    && !c.used) return false;
+      if (search && ![c.title,c.store,c.code,c.notes].join(" ").includes(search)) return false;
+      return true;
+    })
+    .sort((a, b) => {
+      if (sortBy === "expiry")    return new Date(a.expiry) - new Date(b.expiry);
+      if (sortBy === "category")  return a.category.localeCompare(b.category);
+      if (sortBy === "store")     return (a.store||"").localeCompare(b.store||"");
+      return 0;
+    });
+
+  // ── STYLES ───────────────────────────────────────────────────────────────
+  const S = {
+    app:    { fontFamily:"'Rubik','Heebo',sans-serif", direction:"rtl", background:"#080c14", minHeight:"100vh", color:"#eef2ff", maxWidth:440, margin:"0 auto", position:"relative" },
+    header: { background:"linear-gradient(160deg,#0d1b2a,#1a2744)", padding:"18px 18px 14px", position:"sticky", top:0, zIndex:100, borderBottom:"1px solid rgba(99,179,237,0.12)" },
+    hTitle: { fontSize:24, fontWeight:900, background:"linear-gradient(90deg,#63b3ed,#b794f4)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", margin:0, letterSpacing:-0.5 },
+    hSub:   { fontSize:12, color:"rgba(255,255,255,0.4)", marginTop:2 },
+    nav:    { display:"flex", gap:6, marginTop:12 },
+    navBtn: (a) => ({ flex:1, padding:"8px 4px", borderRadius:10, border:"none", cursor:"pointer", fontSize:12, fontWeight:800, fontFamily:"inherit", transition:"all 0.15s", background: a ? "linear-gradient(135deg,#63b3ed,#b794f4)" : "rgba(255,255,255,0.06)", color: a ? "#080c14" : "rgba(255,255,255,0.55)" }),
+    body:   { padding:"14px 14px 90px" },
+    card:   { background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.07)", borderRadius:14, padding:14, marginBottom:10, backdropFilter:"blur(8px)", transition:"all 0.15s" },
+    statG:  { display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:18 },
+    statC:  (col) => ({ background:`${col}18`, border:`1px solid ${col}30`, borderRadius:14, padding:"14px 12px", textAlign:"center" }),
+    statN:  { fontSize:38, fontWeight:900, lineHeight:1 },
+    pill:   (col) => ({ background:`${col}20`, color:col, border:`1px solid ${col}35`, borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700, display:"inline-block" }),
+    input:  { width:"100%", background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.1)", borderRadius:10, padding:"11px 13px", color:"#eef2ff", fontSize:14, fontFamily:"inherit", boxSizing:"border-box", outline:"none" },
+    select: { width:"100%", background:"#0d1b2a", border:"1px solid rgba(255,255,255,0.1)", borderRadius:10, padding:"11px 13px", color:"#eef2ff", fontSize:14, fontFamily:"inherit", boxSizing:"border-box" },
+    label:  { fontSize:11, color:"rgba(255,255,255,0.38)", marginBottom:4, display:"block" },
+    btn:    (bg,col) => ({ background: bg||"linear-gradient(135deg,#63b3ed,#b794f4)", border:"none", borderRadius:11, padding:"13px 18px", color: col||"#080c14", fontWeight:800, fontSize:14, cursor:"pointer", fontFamily:"inherit", width:"100%", marginTop:8 }),
+    fab:    { position:"fixed", bottom:22, left:"50%", transform:"translateX(-50%)", background:"linear-gradient(135deg,#63b3ed,#b794f4)", border:"none", borderRadius:50, width:58, height:58, fontSize:26, cursor:"pointer", boxShadow:"0 8px 28px rgba(99,179,237,0.45)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center" },
+    toast:  (t) => ({ position:"fixed", top:16, left:"50%", transform:"translateX(-50%)", background: t==="error"?"#7f1d1d": t==="info"?"#1e3a5f":"#14532d", color:"#fff", padding:"10px 18px", borderRadius:20, fontWeight:700, zIndex:9999, fontSize:13, whiteSpace:"nowrap", boxShadow:"0 4px 20px rgba(0,0,0,0.5)", maxWidth:"90vw" }),
+  };
+
+  const ExpiryBadge = ({ expiry, used }) => {
+    if (used) return <span style={{ background:"#1f2937", color:"#6b7280", borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700 }}>נוצל ✓</span>;
+    const d = getDaysLeft(expiry);
+    if (d < 0)  return <span style={{ background:"#450a0a", color:"#f87171", borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700 }}>פג תוקף</span>;
+    if (d === 0) return <span style={{ background:"#451a03", color:"#fb923c", borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700, animation:"pulse 1s infinite" }}>⚡ פג היום!</span>;
+    if (d <= 3)  return <span style={{ background:"#422006", color:"#fbbf24", borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700 }}>🔥 {d} ימים</span>;
+    return <span style={{ background:"#052e16", color:"#4ade80", borderRadius:20, padding:"2px 9px", fontSize:11, fontWeight:700 }}>{d} ימים</span>;
+  };
+
+  // ═══════════════════════════════════════════════
